@@ -1,16 +1,15 @@
 import express from "express";
 import path from "path";
-import fs from "fs";
 import multer from "multer";
 import { createServer as createViteServer } from "vite";
 import { createClient } from '@supabase/supabase-js';
 
-// استيراد البيانات الافتراضية من src
 import { INITIAL_PROJECTS, SERVICES, CASE_STUDIES, INITIAL_SITE_TEXTS } from "./src/data.ts";
 
 const supabaseUrl = 'https://ivtgzlneskrqvssjepjr.supabase.co';
 const supabaseKey = 'sb_publishable_YcOzVLovfj2IeoZR5wNGGw_GXtr-gOR';
 const supabase = createClient(supabaseUrl, supabaseKey);
+const BUCKET_NAME = 'elhamc-files';
 
 async function startServer() {
   const app = express();
@@ -25,27 +24,17 @@ async function startServer() {
         .single();
       if (error && error.code !== 'PGRST116') throw error;
       return data ? JSON.parse(data.value) : null;
-    } catch (err: any) {
-      console.log(`No ${key} in Supabase yet`);
+    } catch {
       return null;
     }
   }
 
   async function setData(key: string, value: any) {
-    try {
-      const existing = await getData(key);
-      if (existing !== null) {
-        await supabase
-          .from('site_data')
-          .update({ value: JSON.stringify(value) })
-          .eq('key', key);
-      } else {
-        await supabase
-          .from('site_data')
-          .insert({ key, value: JSON.stringify(value) });
-      }
-    } catch (err: any) {
-      console.error(`Error saving ${key}:`, err.message);
+    const existing = await getData(key);
+    if (existing !== null) {
+      await supabase.from('site_data').update({ value: JSON.stringify(value) }).eq('key', key);
+    } else {
+      await supabase.from('site_data').insert({ key, value: JSON.stringify(value) });
     }
   }
 
@@ -66,57 +55,43 @@ async function startServer() {
   await initDatabase();
 
   // =========================================
-  // إعداد رفع الملفات (multer)
+  // إعداد Supabase Storage للملفات
   // =========================================
-  const uploadsDir = path.join(process.cwd(), "uploads");
-  if (!fs.existsSync(uploadsDir)) {
-    fs.mkdirSync(uploadsDir, { recursive: true });
+  const { data: bucket } = await supabase.storage.getBucket(BUCKET_NAME);
+  if (!bucket) {
+    await supabase.storage.createBucket(BUCKET_NAME, {
+      public: true,
+      fileSizeLimit: 104857600
+    });
+    console.log(`✓ Storage bucket "${BUCKET_NAME}" created`);
   }
 
-  const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-      cb(null, uploadsDir);
-    },
-    filename: (req, file, cb) => {
-      const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-      const ext = path.extname(file.originalname);
-      cb(null, uniqueSuffix + ext);
-    },
-  });
-
   const upload = multer({
-    storage,
-    limits: { fileSize: 100 * 1024 * 1024 }, // 100MB حد أقصى
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 100 * 1024 * 1024 },
   });
 
-  // Middlewares
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
-
-  // خدمة الملفات المرفوعة
-  app.use("/uploads", express.static(uploadsDir));
 
   // =========================================
   // API Routes
   // =========================================
 
-  // GET: استرجاع كل البيانات
   app.get("/api/data", async (req, res) => {
     try {
-      const data = {
+      res.json({
         projects: await getData("projects") || INITIAL_PROJECTS,
         services: await getData("services") || SERVICES,
         caseStudies: await getData("caseStudies") || CASE_STUDIES,
         siteTexts: await getData("siteTexts") || INITIAL_SITE_TEXTS,
-      };
-      res.json(data);
+      });
     } catch (err) {
       console.error("Error loading data:", err);
       res.status(500).json({ error: "Failed to load data" });
     }
   });
 
-  // POST: حفظ البيانات
   app.post("/api/save", async (req, res) => {
     try {
       const { projects, services, caseStudies, siteTexts } = req.body;
@@ -131,41 +106,53 @@ async function startServer() {
     }
   });
 
-  // POST: رفع ملف
-  app.post("/api/upload", upload.single("file"), (req: any, res) => {
+  async function uploadToSupabase(file: Express.Multer.File) {
+    const ext = path.extname(file.originalname);
+    const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    const { error } = await supabase.storage
+      .from(BUCKET_NAME)
+      .upload(filename, file.buffer, { contentType: file.mimetype, upsert: true });
+    if (error) throw error;
+    const { data: { publicUrl } } = supabase.storage
+      .from(BUCKET_NAME)
+      .getPublicUrl(filename);
+    return publicUrl;
+  }
+
+  app.post("/api/upload", upload.single("file"), async (req: any, res) => {
     try {
-      if (!req.file) {
-        return res.status(400).json({ error: "No file uploaded" });
-      }
-      const fileUrl = `/uploads/${req.file.filename}`;
+      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+      const url = await uploadToSupabase(req.file);
       res.json({
         success: true,
-        url: fileUrl,
+        url,
         name: req.file.originalname,
         size: req.file.size,
-        filename: req.file.filename,
+        filename: url.split('/').pop(),
       });
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error uploading file:", err);
-      res.status(500).json({ error: "Failed to upload file" });
+      res.status(500).json({ error: err.message || "Failed to upload file" });
     }
   });
 
-  // POST: رفع ملفات متعددة
-  app.post("/api/upload-multiple", upload.array("files", 10), (req: any, res) => {
+  app.post("/api/upload-multiple", upload.array("files", 10), async (req: any, res) => {
     try {
-      const files: any[] = req.files || [];
-      const result = files.map((file: any) => ({
-        success: true,
-        url: `/uploads/${file.filename}`,
-        name: file.originalname,
-        size: file.size,
-        filename: file.filename,
+      const files: Express.Multer.File[] = req.files || [];
+      const results = await Promise.all(files.map(async (file) => {
+        const url = await uploadToSupabase(file);
+        return {
+          success: true,
+          url,
+          name: file.originalname,
+          size: file.size,
+          filename: url.split('/').pop(),
+        };
       }));
-      res.json(result);
-    } catch (err) {
+      res.json(results);
+    } catch (err: any) {
       console.error("Error uploading files:", err);
-      res.status(500).json({ error: "Failed to upload files" });
+      res.status(500).json({ error: err.message || "Failed to upload files" });
     }
   });
 
@@ -185,14 +172,12 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`\n`);
-    console.log(`  🔥 ELHAMC STUDIO SERVER`);
+    console.log(`\n  🔥 ELHAMC STUDIO SERVER`);
     console.log(`  ════════════════════════`);
     console.log(`  📍 http://localhost:${PORT}`);
-    console.log(`  📁 SQLite: database.sqlite`);
-    console.log(`  📂 Uploads: /uploads/`);
-    console.log(`  🟢 Status: RUNNING`);
-    console.log(`\n`);
+    console.log(`  💾 Supabase: Connected`);
+    console.log(`  📂 Storage: ${BUCKET_NAME}`);
+    console.log(`  🟢 Status: RUNNING\n`);
   });
 }
 
