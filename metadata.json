@@ -1,0 +1,6 @@
+{
+  "name": "إلهامك | استوديو تصميم وهوية بصرية",
+  "description": "استوديو تصميم وهويات بصرية فاخر يقدم خدمات الهوية التجارية وإدارة المشاريع الإبداعية بأسلوب مميز وتجربة مستخدم متكاملة.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
