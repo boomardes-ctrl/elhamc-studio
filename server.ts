@@ -3,93 +3,67 @@ import path from "path";
 import fs from "fs";
 import multer from "multer";
 import { createServer as createViteServer } from "vite";
-import initSqlJs from "sql.js";
+import { createClient } from '@supabase/supabase-js';
 
 // استيراد البيانات الافتراضية من src
 import { INITIAL_PROJECTS, SERVICES, CASE_STUDIES, INITIAL_SITE_TEXTS } from "./src/data.ts";
+
+const supabaseUrl = 'https://ivtgzlneskrqvssjepjr.supabase.co';
+const supabaseKey = 'sb_publishable_YcOzVLovfj2IeoZR5wNGGw_GXtr-gOR';
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // =========================================
-  // إعداد SQLite Database
-  // =========================================
-  const SQL = await initSqlJs();
-  const dbPath = path.join(process.cwd(), "database.sqlite");
-  let db: any;
-
-  function initDatabase() {
-    if (fs.existsSync(dbPath)) {
-      const buffer = fs.readFileSync(dbPath);
-      db = new SQL.Database(buffer);
-      console.log("✓ SQLite database loaded from database.sqlite");
-    } else {
-      db = new SQL.Database();
-      console.log("✓ New SQLite database created");
-    }
-
-    // إنشاء الجداول
-    db.run(`
-      CREATE TABLE IF NOT EXISTS site_data (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      )
-    `);
-
-    // التحقق من وجود بيانات أولية
-    const row = db.exec("SELECT COUNT(*) as count FROM site_data");
-    const count = row[0]?.values[0][0] || 0;
-
-    if (count === 0) {
-      console.log("Initializing database with default data...");
-      
-      const insertStmt = db.prepare("INSERT OR REPLACE INTO site_data (key, value) VALUES (?, ?)");
-      insertStmt.run(["projects", JSON.stringify(INITIAL_PROJECTS)]);
-      insertStmt.run(["services", JSON.stringify(SERVICES)]);
-      insertStmt.run(["caseStudies", JSON.stringify(CASE_STUDIES)]);
-      insertStmt.run(["siteTexts", JSON.stringify(INITIAL_SITE_TEXTS)]);
-      insertStmt.free();
-      
-      saveDatabase();
-      console.log("✓ Default data saved to SQLite");
+  async function getData(key: string): Promise<any> {
+    try {
+      const { data, error } = await supabase
+        .from('site_data')
+        .select('value')
+        .eq('key', key)
+        .single();
+      if (error && error.code !== 'PGRST116') throw error;
+      return data ? JSON.parse(data.value) : null;
+    } catch (err: any) {
+      console.log(`No ${key} in Supabase yet`);
+      return null;
     }
   }
 
-  function saveDatabase() {
+  async function setData(key: string, value: any) {
     try {
-      const data = db.export();
-      const buffer = Buffer.from(data);
-      fs.writeFileSync(dbPath, buffer);
-    } catch (err) {
-      console.error("Error saving database:", err);
-    }
-  }
-
-  function getData(key: string): any {
-    try {
-      const result = db.exec(`SELECT value FROM site_data WHERE key = '${key}'`);
-      if (result.length > 0 && result[0].values.length > 0) {
-        return JSON.parse(result[0].values[0][0] as string);
+      const existing = await getData(key);
+      if (existing !== null) {
+        await supabase
+          .from('site_data')
+          .update({ value: JSON.stringify(value) })
+          .eq('key', key);
+      } else {
+        await supabase
+          .from('site_data')
+          .insert({ key, value: JSON.stringify(value) });
       }
-    } catch (err) {
-      console.error(`Error reading ${key}:`, err);
-    }
-    return null;
-  }
-
-  function setData(key: string, value: any) {
-    try {
-      const stmt = db.prepare("INSERT OR REPLACE INTO site_data (key, value) VALUES (?, ?)");
-      stmt.run([key, JSON.stringify(value)]);
-      stmt.free();
-    } catch (err) {
-      console.error(`Error saving ${key}:`, err);
+    } catch (err: any) {
+      console.error(`Error saving ${key}:`, err.message);
     }
   }
 
-  // تهيئة قاعدة البيانات
-  initDatabase();
+  async function initDatabase() {
+    const projects = await getData("projects");
+    if (!projects) {
+      console.log("Initializing Supabase with default data...");
+      await setData("projects", INITIAL_PROJECTS);
+      await setData("services", SERVICES);
+      await setData("caseStudies", CASE_STUDIES);
+      await setData("siteTexts", INITIAL_SITE_TEXTS);
+      console.log("✓ Default data saved to Supabase");
+    } else {
+      console.log("✓ Data loaded from Supabase");
+    }
+  }
+
+  await initDatabase();
 
   // =========================================
   // إعداد رفع الملفات (multer)
@@ -127,13 +101,13 @@ async function startServer() {
   // =========================================
 
   // GET: استرجاع كل البيانات
-  app.get("/api/data", (req, res) => {
+  app.get("/api/data", async (req, res) => {
     try {
       const data = {
-        projects: getData("projects") || INITIAL_PROJECTS,
-        services: getData("services") || SERVICES,
-        caseStudies: getData("caseStudies") || CASE_STUDIES,
-        siteTexts: getData("siteTexts") || INITIAL_SITE_TEXTS,
+        projects: await getData("projects") || INITIAL_PROJECTS,
+        services: await getData("services") || SERVICES,
+        caseStudies: await getData("caseStudies") || CASE_STUDIES,
+        siteTexts: await getData("siteTexts") || INITIAL_SITE_TEXTS,
       };
       res.json(data);
     } catch (err) {
@@ -143,14 +117,13 @@ async function startServer() {
   });
 
   // POST: حفظ البيانات
-  app.post("/api/save", (req, res) => {
+  app.post("/api/save", async (req, res) => {
     try {
       const { projects, services, caseStudies, siteTexts } = req.body;
-      if (projects) setData("projects", projects);
-      if (services) setData("services", services);
-      if (caseStudies) setData("caseStudies", caseStudies);
-      if (siteTexts) setData("siteTexts", siteTexts);
-      saveDatabase();
+      if (projects) await setData("projects", projects);
+      if (services) await setData("services", services);
+      if (caseStudies) await setData("caseStudies", caseStudies);
+      if (siteTexts) await setData("siteTexts", siteTexts);
       res.json({ success: true });
     } catch (err) {
       console.error("Error saving data:", err);
